@@ -26,7 +26,8 @@
       display: none;
       position: fixed;
       inset: 0;
-      place-items: center;
+      align-items: center;
+      justify-content: center;
       background: #000;
       color: #f55;
       font: 16px monospace;
@@ -64,224 +65,235 @@
    * WebGL 2 check
    * ========================================================================= */
   if (!document.createElement('canvas').getContext('webgl2')) {
-    document.getElementById('webgl-error').style.display = 'grid';
+    document.getElementById('webgl-error').style.display = 'flex';
     throw new Error('WebGL 2 not available');
   }
 
   /* =========================================================================
-   * VERTEX SHADER  —  full-screen quad, position.xy used as NDC
+   * VERTEX SHADER
+   *
+   * Rules for THREE.ShaderMaterial + glslVersion: THREE.GLSL3:
+   *   - Do NOT include #version 300 es  — Three.js prepends it automatically.
+   *   - Do NOT redeclare `position`     — Three.js injects it as an attribute.
+   *   - Use `out` for varyings          — GLSL ES 3.00 syntax.
    * ========================================================================= */
-  const VERT = /* glsl */`#version 300 es
-  in  vec3 position;
-  out vec2 vNDC;
-  void main() {
-    vNDC        = position.xy;
-    gl_Position = vec4(position.xy, 0.0, 1.0);
-  }`;
+  const VERT = /* glsl */`
+out vec2 vNDC;
+
+void main() {
+  /* position is a vec3 attribute provided automatically by Three.js */
+  vNDC        = position.xy;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}`;
 
   /* =========================================================================
    * FRAGMENT SHADER
    *
-   * Ported from mandelbulb.c (OpenGL 3.3) to GLSL ES 3.00 (WebGL 2).
-   * Ray marching + Mandelbulb DE are preserved exactly.
-   * Camera is spherical-orbit driven by uYaw / uPitch / uRadius.
-   * ========================================================================= */
-  const FRAG = /* glsl */`#version 300 es
-  precision highp float;
-
-  in  vec2  vNDC;
-  out vec4  fragColor;
-
-  uniform float uTime;
-  uniform vec2  uResolution;   /* logical pixels (for aspect ratio only)  */
-  uniform float uYaw;          /* camera orbit angle around Y             */
-  uniform float uPitch;        /* camera elevation angle                  */
-  uniform float uPower;        /* Mandelbulb exponent  (animated 3–13)    */
-  uniform float uRadius;       /* camera distance from origin             */
-
-  /* -------------------------------------------------------------------
-   * Global: carries the iteration count out of the DE to the caller.
-   * Mutable globals are valid in GLSL ES 3.00.
-   * ------------------------------------------------------------------- */
-  float gIter = 0.0;
-
-  /* -------------------------------------------------------------------
-   * Mandelbulb distance estimator  (variable power n)
+   * Ported from mandelbulb.c (OpenGL 3.3 Core) → GLSL ES 3.00 (WebGL 2).
+   * The Mandelbulb distance estimator and ray marching are preserved exactly.
+   * Camera is spherical-orbit driven by uYaw / uPitch / uRadius uniforms.
    *
-   *   Iterate:  z  <- z^n + c
-   *             dr <- n * r^(n-1) * dr + 1
-   *   DE = 0.5 * |z| * ln|z| / |dr|
-   * ------------------------------------------------------------------- */
-  float mandelbulbDE(vec3 pos) {
-    vec3  z  = pos;
-    float dr = 1.0;
-    float r  = 0.0;
-    gIter    = 0.0;
+   * Rules for THREE.ShaderMaterial + glslVersion: THREE.GLSL3:
+   *   - Do NOT include #version 300 es  — Three.js prepends it automatically.
+   *   - DO include precision highp float explicitly (first statement).
+   *   - Use `in` for varyings, declare a single `out vec4 fragColor` output.
+   * ========================================================================= */
+  const FRAG = /* glsl */`
+precision highp float;
 
-    for (int i = 0; i < 12; i++) {
-      r = length(z);
-      if (r > 2.0) break;
+in  vec2  vNDC;
+out vec4  fragColor;
 
-      /* convert to spherical polars */
-      float theta = acos(clamp(z.z / r, -1.0, 1.0));
-      float phi   = atan(z.y, z.x);
+uniform float uTime;
+uniform vec2  uResolution;  /* window dimensions — used for aspect ratio    */
+uniform float uYaw;         /* camera orbit angle around Y axis             */
+uniform float uPitch;       /* camera elevation angle                       */
+uniform float uPower;       /* Mandelbulb exponent (animated 3 – 13)        */
+uniform float uRadius;      /* camera distance from origin                  */
 
-      /* update derivative magnitude */
-      dr = pow(r, uPower - 1.0) * uPower * dr + 1.0;
+/* -------------------------------------------------------------------------
+ * Global: carries the DE iteration count to the caller.
+ * Mutable globals with constant initialisers are valid in GLSL ES 3.00.
+ * ------------------------------------------------------------------------- */
+float gIter = 0.0;
 
-      /* raise to nth power in polar space */
-      float zr = pow(r, uPower);
-      theta   *= uPower;
-      phi     *= uPower;
+/* -------------------------------------------------------------------------
+ * Mandelbulb distance estimator  (variable power n)
+ *
+ *   Iterate:  z  <- z^n + c
+ *             dr <- n * r^(n-1) * dr + 1
+ *   DE = 0.5 * |z| * ln|z| / |dr|
+ * ------------------------------------------------------------------------- */
+float mandelbulbDE(vec3 pos) {
+  vec3  z  = pos;
+  float dr = 1.0;
+  float r  = 0.0;
+  gIter    = 0.0;
 
-      /* back to Cartesian and add c */
-      z  = zr * vec3(sin(theta) * cos(phi),
-                     sin(theta) * sin(phi),
-                     cos(theta));
-      z += pos;
+  for (int i = 0; i < 12; i++) {
+    r = length(z);
+    if (r > 2.0) break;
 
-      gIter = float(i + 1);
-    }
+    /* convert to spherical polars */
+    float theta = acos(clamp(z.z / r, -1.0, 1.0));
+    float phi   = atan(z.y, z.x);
 
-    /* DE formula — safe against r == 0 */
-    return 0.5 * log(max(r, 1e-10)) * r / max(dr, 1e-10);
+    /* update derivative magnitude */
+    dr = pow(r, uPower - 1.0) * uPower * dr + 1.0;
+
+    /* raise to nth power in polar space */
+    float zr = pow(r, uPower);
+    theta   *= uPower;
+    phi     *= uPower;
+
+    /* back to Cartesian and add c */
+    z  = zr * vec3(sin(theta) * cos(phi),
+                   sin(theta) * sin(phi),
+                   cos(theta));
+    z += pos;
+
+    gIter = float(i + 1);
   }
 
-  /* -------------------------------------------------------------------
-   * Central-difference surface normal  (6 DE evaluations)
-   * ------------------------------------------------------------------- */
-  vec3 calcNormal(vec3 p) {
-    const float e = 0.0005;
-    return normalize(vec3(
-      mandelbulbDE(p + vec3( e, 0, 0)) - mandelbulbDE(p - vec3( e, 0, 0)),
-      mandelbulbDE(p + vec3(0,  e, 0)) - mandelbulbDE(p - vec3(0,  e, 0)),
-      mandelbulbDE(p + vec3(0, 0,  e)) - mandelbulbDE(p - vec3(0, 0,  e))
-    ));
+  /* DE formula — guarded against r == 0 */
+  return 0.5 * log(max(r, 1e-10)) * r / max(dr, 1e-10);
+}
+
+/* -------------------------------------------------------------------------
+ * Central-difference surface normal  (6 DE evaluations)
+ * ------------------------------------------------------------------------- */
+vec3 calcNormal(vec3 p) {
+  const float e = 0.0005;
+  return normalize(vec3(
+    mandelbulbDE(p + vec3( e, 0, 0)) - mandelbulbDE(p - vec3( e, 0, 0)),
+    mandelbulbDE(p + vec3(0,  e, 0)) - mandelbulbDE(p - vec3(0,  e, 0)),
+    mandelbulbDE(p + vec3(0, 0,  e)) - mandelbulbDE(p - vec3(0, 0,  e))
+  ));
+}
+
+/* -------------------------------------------------------------------------
+ * Horizon-based ambient occlusion  (5 samples along normal)
+ * ------------------------------------------------------------------------- */
+float calcAO(vec3 p, vec3 n) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 5; i++) {
+    float h = 0.01 + 0.18 * float(i) / 4.0;
+    float d = mandelbulbDE(p + n * h);
+    occ    += (h - d) * sca;
+    sca    *= 0.82;
+  }
+  return clamp(1.0 - 2.8 * occ, 0.0, 1.0);
+}
+
+/* -------------------------------------------------------------------------
+ * Soft shadow  (ray march from p toward light)
+ * ------------------------------------------------------------------------- */
+float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
+  float res = 1.0, t = mint;
+  for (int i = 0; i < 24; i++) {
+    float h = mandelbulbDE(ro + rd * t);
+    if (h < 0.0005) return 0.0;
+    res  = min(res, k * h / t);
+    t   += h;
+    if (t > maxt) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+/* ========================================================================= */
+void main() {
+  float ar = uResolution.x / uResolution.y;
+  vec2  uv = vec2(vNDC.x * ar, vNDC.y);
+
+  /* ---- spherical-orbit camera ------------------------------------------ */
+  /*  Camera sits on a sphere of radius uRadius, always looking at origin.   */
+  vec3 ro  = vec3(uRadius * cos(uPitch) * sin(uYaw),
+                  uRadius * sin(uPitch),
+                  uRadius * cos(uPitch) * cos(uYaw));
+  vec3 fwd = normalize(-ro);
+  vec3 rgt = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)));
+  vec3 up  = cross(rgt, fwd);
+  vec3 rd  = normalize(uv.x * rgt + uv.y * up + 1.65 * fwd);
+
+  /* ---- sphere-trace ----------------------------------------------------- */
+  float t       = 0.25;
+  bool  hit     = false;
+  float hitIter = 0.0;
+
+  for (int i = 0; i < 90; i++) {
+    float d = mandelbulbDE(ro + rd * t);
+    if (d < 0.00045) { hit = true; hitIter = gIter; break; }
+    if (t > 9.0) break;
+    t += d;
   }
 
-  /* -------------------------------------------------------------------
-   * Horizon-based ambient occlusion  (5 samples along normal)
-   * ------------------------------------------------------------------- */
-  float calcAO(vec3 p, vec3 n) {
-    float occ = 0.0, sca = 1.0;
-    for (int i = 0; i < 5; i++) {
-      float h = 0.01 + 0.18 * float(i) / 4.0;
-      float d = mandelbulbDE(p + n * h);
-      occ    += (h - d) * sca;
-      sca    *= 0.82;
-    }
-    return clamp(1.0 - 2.8 * occ, 0.0, 1.0);
+  /* ---- shading ---------------------------------------------------------- */
+  vec3 col;
+
+  if (hit) {
+    vec3  p  = ro + rd * t;
+    vec3  n  = calcNormal(p);
+    float ao = calcAO(p, n);
+
+    /* key + fill lights */
+    vec3  l1    = normalize(vec3( 0.75,  0.70, -0.25));
+    vec3  l2    = normalize(vec3(-0.50,  0.20,  0.85));
+    float diff1 = max(dot(n, l1), 0.0);
+    float diff2 = max(dot(n, l2), 0.0) * 0.30;
+    float shad  = softShadow(p, l1, 0.02, 4.0, 12.0);
+
+    /* Phong specular */
+    vec3  refl = reflect(-l1, n);
+    float spec = pow(max(dot(refl, normalize(-rd)), 0.0), 56.0);
+
+    /* ---- normal-palette base colour ------------------------------------- */
+    float ty = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    float tx = clamp(n.x * 0.5 + 0.5, 0.0, 1.0);
+    float tz = clamp(n.z * 0.5 + 0.5, 0.0, 1.0);
+
+    vec3 base = mix(vec3(0.04, 0.10, 0.50),   /* deep indigo */
+                    vec3(0.88, 0.58, 0.08),   /* warm gold   */
+                    ty);
+    base = mix(base, vec3(0.50, 0.05, 0.48),  /* purple      */
+               tx * 0.40);
+    base = mix(base, vec3(0.10, 0.48, 0.55),  /* teal        */
+               tz * 0.25);
+
+    /* ---- iteration-count cosine palette overlay ------------------------- */
+    /*  Maps 0–12 iterations → vivid neon bands on fractal edges            */
+    float fi   = hitIter / 12.0;
+    vec3  iPal = 0.5 + 0.5 * cos(6.28318 * (fi * vec3(1.0, 0.7, 0.4)
+                                            + vec3(0.0, 0.15, 0.25)));
+    base = mix(base, iPal, 0.45);
+
+    /* combine lighting */
+    col  = base * (0.08 + diff1 * shad + diff2) * ao;
+    col += vec3(1.00, 0.88, 0.70) * spec * shad * 0.85;
+
+    /* depth fog toward deep-space background */
+    col = mix(vec3(0.01, 0.01, 0.04), col, exp(-t * 0.20));
+
+  } else {
+    /* ---- background: deep-space gradient + procedural stars ------------- */
+    float grad = 1.0 - smoothstep(0.0, 1.6, length(uv));
+    col = mix(vec3(0.00, 0.00, 0.02), vec3(0.01, 0.01, 0.06), grad);
+
+    vec2  sc   = floor(vNDC * 380.0);
+    float hash = fract(sin(dot(sc, vec2(127.1, 311.7))) * 43758.5453);
+    float star = smoothstep(0.994, 1.000, hash);
+    float bri  = fract(sin(dot(sc, vec2(269.5, 183.3))) * 17319.7);
+    col += vec3(star * (0.4 + 0.6 * bri));
   }
 
-  /* -------------------------------------------------------------------
-   * Soft shadow  (ray march from p toward light)
-   * ------------------------------------------------------------------- */
-  float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
-    float res = 1.0, t = mint;
-    for (int i = 0; i < 24; i++) {
-      float h = mandelbulbDE(ro + rd * t);
-      if (h < 0.0005) return 0.0;
-      res  = min(res, k * h / t);
-      t   += h;
-      if (t > maxt) break;
-    }
-    return clamp(res, 0.0, 1.0);
-  }
-
-  /* =================================================================== */
-  void main() {
-    float ar = uResolution.x / uResolution.y;
-    vec2  uv = vec2(vNDC.x * ar, vNDC.y);
-
-    /* ---- spherical-orbit camera from uniforms ----------------------- */
-    /*  ro sits on a sphere of radius uRadius, looking at the origin     */
-    vec3 ro  = vec3(uRadius * cos(uPitch) * sin(uYaw),
-                    uRadius * sin(uPitch),
-                    uRadius * cos(uPitch) * cos(uYaw));
-    vec3 fwd = normalize(-ro);
-    vec3 rgt = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)));
-    vec3 up  = cross(rgt, fwd);
-    vec3 rd  = normalize(uv.x * rgt + uv.y * up + 1.65 * fwd);
-
-    /* ---- sphere-trace ----------------------------------------------- */
-    float t       = 0.25;
-    bool  hit     = false;
-    float hitIter = 0.0;
-
-    for (int i = 0; i < 90; i++) {
-      float d = mandelbulbDE(ro + rd * t);
-      if (d < 0.00045) { hit = true; hitIter = gIter; break; }
-      if (t > 9.0) break;
-      t += d;
-    }
-
-    /* ---- shading ---------------------------------------------------- */
-    vec3 col;
-
-    if (hit) {
-      vec3  p  = ro + rd * t;
-      vec3  n  = calcNormal(p);
-      float ao = calcAO(p, n);
-
-      /* key + fill lights */
-      vec3  l1    = normalize(vec3( 0.75,  0.70, -0.25));
-      vec3  l2    = normalize(vec3(-0.50,  0.20,  0.85));
-      float diff1 = max(dot(n, l1), 0.0);
-      float diff2 = max(dot(n, l2), 0.0) * 0.30;
-      float shad  = softShadow(p, l1, 0.02, 4.0, 12.0);
-
-      /* Phong specular */
-      vec3  refl = reflect(-l1, n);
-      float spec = pow(max(dot(refl, normalize(-rd)), 0.0), 56.0);
-
-      /* ---- normal-palette base colour ------------------------------- */
-      float ty = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-      float tx = clamp(n.x * 0.5 + 0.5, 0.0, 1.0);
-      float tz = clamp(n.z * 0.5 + 0.5, 0.0, 1.0);
-
-      vec3 base = mix(vec3(0.04, 0.10, 0.50),   /* deep indigo  */
-                      vec3(0.88, 0.58, 0.08),   /* warm gold    */
-                      ty);
-      base = mix(base, vec3(0.50, 0.05, 0.48),  /* purple       */
-                 tx * 0.40);
-      base = mix(base, vec3(0.10, 0.48, 0.55),  /* teal         */
-                 tz * 0.25);
-
-      /* ---- iteration-count cosine palette overlay ------------------- */
-      /*  Maps 0–12 DE iterations to vivid neon bands on fractal edges   */
-      float fi   = hitIter / 12.0;
-      vec3  iPal = 0.5 + 0.5 * cos(6.28318 * (fi * vec3(1.0, 0.7, 0.4)
-                                              + vec3(0.0, 0.15, 0.25)));
-      base = mix(base, iPal, 0.45);
-
-      /* combine */
-      col  = base * (0.08 + diff1 * shad + diff2) * ao;
-      col += vec3(1.00, 0.88, 0.70) * spec * shad * 0.85;
-
-      /* depth fog toward deep-space background */
-      col = mix(vec3(0.01, 0.01, 0.04), col, exp(-t * 0.20));
-
-    } else {
-      /* ---- background: deep-space gradient + procedural stars ------- */
-      float grad = 1.0 - smoothstep(0.0, 1.6, length(uv));
-      col = mix(vec3(0.00, 0.00, 0.02), vec3(0.01, 0.01, 0.06), grad);
-
-      vec2  sc   = floor(vNDC * 380.0);
-      float hash = fract(sin(dot(sc, vec2(127.1, 311.7))) * 43758.5453);
-      float star = smoothstep(0.994, 1.000, hash);
-      float bri  = fract(sin(dot(sc, vec2(269.5, 183.3))) * 17319.7);
-      col += vec3(star * (0.4 + 0.6 * bri));
-    }
-
-    /* gamma 2.2 */
-    col       = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
-    fragColor = vec4(col, 1.0);
-  }`;
+  /* gamma 2.2 */
+  col       = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
+  fragColor = vec4(col, 1.0);
+}`;
 
   /* =========================================================================
    * Three.js renderer
    * ========================================================================= */
-  const PR = Math.min(window.devicePixelRatio, 1.5); /* cap for perf */
+  const PR = Math.min(window.devicePixelRatio, 1.5); /* cap resolution for perf */
 
   const renderer = new THREE.WebGLRenderer({ antialias: false });
   renderer.setPixelRatio(PR);
@@ -291,19 +303,24 @@
   const scene  = new THREE.Scene();
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
-  /* ---- uniforms --------------------------------------------------------- */
+  /* ---- uniforms ---------------------------------------------------------- */
   const uniforms = {
     uTime:       { value: 0.0 },
     uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-    uYaw:        { value: Math.PI },   /* start facing the origin from +Z */
+    uYaw:        { value: Math.PI },  /* start facing origin from +Z side */
     uPitch:      { value: 0.0 },
     uPower:      { value: 8.0 },
     uRadius:     { value: 2.7 },
   };
 
   /* ---- full-screen quad -------------------------------------------------- */
-  /*  PlaneGeometry(2,2) spans NDC [-1,1]^2, matching the vertex shader.     */
-  const material = new THREE.RawShaderMaterial({
+  /*
+   * THREE.ShaderMaterial + glslVersion: THREE.GLSL3:
+   *   - Three.js owns "#version 300 es" — never put it in shader strings.
+   *   - Three.js auto-injects the `position` attribute into the vertex shader.
+   *   - depthTest/depthWrite off because we're painting the whole screen.
+   */
+  const material = new THREE.ShaderMaterial({
     glslVersion:    THREE.GLSL3,
     uniforms,
     vertexShader:   VERT,
@@ -312,18 +329,19 @@
     depthWrite: false,
   });
 
+  /* PlaneGeometry(2,2) spans NDC [-1,1]^2 — matches the vertex shader. */
   scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
 
   /* =========================================================================
    * Mouse / touch interaction
    * ========================================================================= */
-  let   isDragging  = false;
-  let   lastX = 0, lastY = 0;
-  let   yawOffset   = 0.0;   /* accumulated drag in X  → added to auto-yaw   */
-  let   pitchOffset = 0.0;   /* accumulated drag in Y  → added to auto-pitch */
+  let isDragging  = false;
+  let lastX = 0, lastY = 0;
+  let yawOffset   = 0.0;  /* accumulated X drag → added on top of auto-yaw   */
+  let pitchOffset = 0.0;  /* accumulated Y drag → added on top of auto-pitch  */
 
   const DRAG_SCALE  = 0.005;
-  const PITCH_LIMIT = 1.35;  /* ~77° */
+  const PITCH_LIMIT = 1.35; /* ~77° — avoids gimbal flip near the poles */
 
   function onDragStart(x, y) { isDragging = true; lastX = x; lastY = y; }
   function onDragMove(x, y) {
@@ -347,13 +365,13 @@
     e.preventDefault();
     onDragStart(e.touches[0].clientX, e.touches[0].clientY);
   }, { passive: false });
-  el.addEventListener('touchmove',  e => {
+  el.addEventListener('touchmove', e => {
     e.preventDefault();
     onDragMove(e.touches[0].clientX, e.touches[0].clientY);
   }, { passive: false });
-  el.addEventListener('touchend',   onDragEnd);
+  el.addEventListener('touchend', onDragEnd);
 
-  /* scroll to zoom */
+  /* scroll / pinch-zoom */
   el.addEventListener('wheel', e => {
     e.preventDefault();
     uniforms.uRadius.value = Math.max(1.4, Math.min(6.5,
@@ -361,7 +379,7 @@
   }, { passive: false });
 
   /* =========================================================================
-   * Resize
+   * Resize handler
    * ========================================================================= */
   window.addEventListener('resize', () => {
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -370,26 +388,32 @@
 
   /* =========================================================================
    * Animation loop
+   *
+   * uTime  — drives the animated power and is available in the shader.
+   * uYaw   — auto-orbit (0.22 rad/s) plus any mouse-drag offset.
+   * uPitch — gentle bob (sin wave) plus any mouse-drag offset.
+   * uPower — Mandelbulb exponent morphs 3→13→3 on a ~15 s cycle.
    * ========================================================================= */
-  const clock     = new THREE.Clock();
-  const powerEl   = document.getElementById('powerVal');
+  const clock   = new THREE.Clock();
+  const powerEl = document.getElementById('powerVal');
 
   function animate() {
     requestAnimationFrame(animate);
 
     const t = clock.getElapsedTime();
 
-    /* animated power: Mandelbulb morphs between ~3 and ~13 every ~15 s */
+    /* animated power: bulb blooms and collapses every ~15 s */
     const power = 8.0 + Math.sin(t * 0.4) * 5.0;
     uniforms.uPower.value = power;
 
-    /* auto-orbit + mouse offset                                          */
-    /* auto-yaw mirrors the original C orbiting camera speed (0.22 r/s)  */
+    /* camera orbit — auto-rotation speed matches original C version */
     uniforms.uYaw.value   = t * 0.22 + yawOffset;
     uniforms.uPitch.value = Math.sin(t * 0.17) * 0.35 + pitchOffset;
-    uniforms.uTime.value  = t;
 
-    /* update HUD */
+    /* time uniform — available in shader for future effects */
+    uniforms.uTime.value = t;
+
+    /* HUD readout */
     powerEl.textContent = power.toFixed(1);
 
     renderer.render(scene, camera);
