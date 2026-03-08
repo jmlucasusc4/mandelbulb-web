@@ -1,349 +1,115 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Mandelbulb Web | jmlucasusc4</title>
-  <style>
-    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; overflow: hidden; touch-action: none; }
-    canvas { display: block; }
-    #hud {
-      position: fixed; top: 14px; left: 16px;
-      color: rgba(180,210,255,0.45);
-      font: 11px/2 'Courier New', monospace;
-      letter-spacing: .07em;
-      pointer-events: none; user-select: none;
-      text-shadow: 0 0 10px rgba(80,140,255,.3);
-    }
-    #hud span { opacity: .35; }
-  </style>
+    <meta charset="UTF-8">
+    <title>Mandelbulb Web | jmlucasusc4</title>
+    <style>body { margin: 0; overflow: hidden; background: #000; }</style>
 </head>
 <body>
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
 
-<div id="hud">
-  MANDELBULB · RAY MARCHING<br>
-  <span>drag</span> rotate &nbsp;|&nbsp; <span>scroll</span> zoom<br>
-  <span>power</span> <span id="pval">8.0</span>
-</div>
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
 
-<script type="importmap">
-{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
-</script>
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
-<script type="module">
-import * as THREE from 'three';
+        const uniforms = {
+            u_time: { value: 0.0 },
+            u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) }
+        };
 
-/* ── WebGL 2 guard ───────────────────────────────────────────────────────── */
-if (!document.createElement('canvas').getContext('webgl2')) {
-  document.body.innerHTML =
-    '<p style="color:#f55;font:16px monospace;padding:2rem">' +
-    'WebGL 2 required. Use Chrome, Firefox, or Edge.</p>';
-  throw new Error('WebGL 2 unavailable');
-}
+        const material = new THREE.ShaderMaterial({
+            glslVersion: THREE.GLSL3,
+            uniforms: uniforms,
+            vertexShader: `
+                out vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                precision highp float;
+                uniform float u_time;
+                uniform vec2 u_resolution;
+                out vec4 fragColor;
 
-/* =========================================================================
- * VERTEX SHADER
- *
- * Rules when using THREE.ShaderMaterial + glslVersion: THREE.GLSL3
- * ──────────────────────────────────────────────────────────────────────────
- *  • Do NOT write #version 300 es — Three.js prepends it automatically.
- *  • Do NOT redeclare `position` or `uv` — Three.js injects them.
- *  • Use `out` for varyings (GLSL ES 3.00).
- *
- * We pass `vNDC` (the NDC xy of each vertex) to the fragment stage so the
- * fragment shader can reconstruct view rays without using gl_FragCoord,
- * which avoids a pixel-centre offset and is more portable.
- * ========================================================================= */
-const VERT = /* glsl */`
-out vec2 vNDC;
+                float map(vec3 p) {
+                    vec3 z = p;
+                    float dr = 1.0;
+                    float r = 0.0;
+                    float power = 8.0;
+                    for (int i = 0; i < 15; i++) {
+                        r = length(z);
+                        if (r > 2.0) break;
 
-void main() {
-  /* `position` is a vec3 attribute auto-injected by Three.js ShaderMaterial.
-     PlaneGeometry(2,2) places vertices at NDC corners (±1, ±1, 0).
-     We write directly to clip space — no matrix needed for a fullscreen quad. */
-  vNDC        = position.xy;
-  gl_Position = vec4(position.xy, 0.0, 1.0);
-}`;
+                        // FIX 1: Clamp the acos input to prevent NaN at the poles
+                        float theta = acos(clamp(z.z / r, -1.0, 1.0));
+                        float phi = atan(z.y, z.x);
 
-/* =========================================================================
- * FRAGMENT SHADER
- *
- * Bugs fixed vs. the original submission
- * ──────────────────────────────────────────────────────────────────────────
- *  BUG 1 (BLACK SCREEN): acos(z.z/r) → acos(clamp(z.z/r,-1,1))
- *         Floating-point gives |z.z/r| > 1 constantly. acos on an out-of-
- *         range input returns NaN. NaN poisons d; all hit tests fail → black.
- *
- *  BUG 2 (NaN/Inf):  log(r) → log(max(r,1e-10))
- *                     /dr    → /max(dr,1e-10)
- *         r can be 0 on the first iteration of a ray through the origin.
- *         log(0) = −∞. dr can collapse toward 0 for certain orbits → ÷0.
- *
- *  BUG 3 (FALSE HITS): hit detection changed from (t < 10.0)
- *                       to a boolean set only when d < 0.001.
- *         The old test returns true for any ray that hasn't exceeded the
- *         march limit, even if it never got close to the surface.
- *
- *  BUG 4 (GEOMETRY):  DE iterations raised 8 → 12.
- *         Power-8 Mandelbulb requires ≥ 12 iterations for a reliable
- *         distance estimate. At 8, the marcher tunnels through thin features.
- *
- *  IMPROVEMENT: Added normal estimation + two-light Phong shading + AO +
- *  iteration-count colour palette so the output is visually meaningful.
- * ========================================================================= */
-const FRAG = /* glsl */`
-precision highp float;
+                        dr = pow(r, power - 1.0) * power * dr + 1.0;
 
-in  vec2  vNDC;
-out vec4  fragColor;
+                        float zr = pow(r, power);
+                        theta *= power;
+                        phi *= power;
 
-uniform float u_time;
-uniform vec2  u_resolution;
-uniform float u_yaw;
-uniform float u_pitch;
-uniform float u_power;
-uniform float u_radius;
+                        z = zr * vec3(sin(theta) * cos(phi), sin(phi) * sin(theta), cos(theta)) + p;
+                    }
+                    // FIX 2: Added a small epsilon to r to prevent log(0)
+                    return 0.5 * log(max(r, 1e-6)) * r / dr;
+                }
 
-/* Global: DE function writes its iteration count here so the caller
-   can use it for colour without a second evaluation pass.            */
-float gIter = 0.0;
+                void main() {
+                    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution.xy) / min(u_resolution.y, u_resolution.x);
 
-/* -------------------------------------------------------------------------
- * Mandelbulb distance estimator  (power = u_power, typically 8)
- *
- * FIX 1: clamp(z.z/r, -1, 1) prevents acos domain errors → no more NaN.
- * FIX 2: log(max(r,1e-10)) and max(dr,1e-10) guard against −∞ and ÷0.
- * FIX 4: 12 iterations (was 8) — required for accurate surface geometry.
- * ------------------------------------------------------------------------- */
-float map(vec3 pos) {
-  vec3  z  = pos;
-  float dr = 1.0;
-  float r  = 0.0;
-  gIter    = 0.0;
+                    // FIX 3: Moved camera slightly back and added rotation logic
+                    float c = cos(u_time * 0.2);
+                    float s = sin(u_time * 0.2);
+                    vec3 ro = vec3(3.0 * s, 0.0, -3.0 * c);
 
-  for (int i = 0; i < 12; i++) {          /* FIX 4: was 8 */
-    r = length(z);
-    if (r > 2.0) break;
+                    vec3 target = vec3(0.0);
+                    vec3 ww = normalize(target - ro);
+                    vec3 uu = normalize(cross(ww, vec3(0.0, 1.0, 0.0)));
+                    vec3 vv = normalize(cross(uu, ww));
+                    vec3 rd = normalize(uv.x * uu + uv.y * vv + 1.5 * ww);
 
-    float theta = acos(clamp(z.z / r, -1.0, 1.0));  /* FIX 1 */
-    float phi   = atan(z.y, z.x);
+                    float t = 0.0;
+                    float d = 0.0;
+                    for(int i = 0; i < 128; i++) { // Increased steps for better detail
+                        vec3 p = ro + rd * t;
+                        d = map(p);
+                        if(d < 0.001 || t > 10.0) break;
+                        t += d;
+                    }
 
-    dr = pow(r, u_power - 1.0) * u_power * dr + 1.0;
+                    // Basic lighting based on ray distance
+                    vec3 col = (t < 10.0) ? vec3(0.2, 0.6, 1.0) * (1.0 - t/5.0) : vec3(0.02);
+                    fragColor = vec4(col, 1.0);
+                }
+            `
+        });
 
-    float zr = pow(r, u_power);
-    theta *= u_power;
-    phi   *= u_power;
+        scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
 
-    z  = zr * vec3(sin(theta) * cos(phi),
-                   sin(theta) * sin(phi),
-                   cos(theta));
-    z += pos;
+        // FIX 4: Handle window resizing
+        window.addEventListener('resize', () => {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            uniforms.u_resolution.value.set(window.innerWidth, window.innerHeight);
+        });
 
-    gIter = float(i + 1);
-  }
-
-  /* FIX 2: guard log and denominator */
-  return 0.5 * log(max(r, 1e-10)) * r / max(dr, 1e-10);
-}
-
-/* Central-difference normal  (6 map() evaluations) ----------------------- */
-vec3 calcNormal(vec3 p) {
-  const float e = 0.0005;
-  return normalize(vec3(
-    map(p + vec3( e,0,0)) - map(p - vec3( e,0,0)),
-    map(p + vec3(0, e,0)) - map(p - vec3(0, e,0)),
-    map(p + vec3(0,0, e)) - map(p - vec3(0,0, e))
-  ));
-}
-
-/* Horizon-based AO  (5 samples along normal) ------------------------------ */
-float calcAO(vec3 p, vec3 n) {
-  float occ = 0.0, sca = 1.0;
-  for (int i = 0; i < 5; i++) {
-    float h = 0.01 + 0.18 * float(i) / 4.0;
-    occ += (h - map(p + n * h)) * sca;
-    sca *= 0.82;
-  }
-  return clamp(1.0 - 2.8 * occ, 0.0, 1.0);
-}
-
-/* Soft shadow ------------------------------------------------------------- */
-float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
-  float res = 1.0, t = mint;
-  for (int i = 0; i < 24; i++) {
-    float h = map(ro + rd * t);
-    if (h < 0.0005) return 0.0;
-    res  = min(res, k * h / t);
-    t   += h;
-    if (t > maxt) break;
-  }
-  return clamp(res, 0.0, 1.0);
-}
-
-/* ========================================================================= */
-void main() {
-  float ar = u_resolution.x / u_resolution.y;
-  vec2  uv = vec2(vNDC.x * ar, vNDC.y);   /* aspect-corrected, Y-up */
-
-  /* ── spherical-orbit camera ─────────────────────────────────────────── */
-  vec3 ro  = vec3(u_radius * cos(u_pitch) * sin(u_yaw),
-                  u_radius * sin(u_pitch),
-                  u_radius * cos(u_pitch) * cos(u_yaw));
-  vec3 fwd = normalize(-ro);
-  vec3 rgt = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)));
-  vec3 up  = cross(rgt, fwd);
-  vec3 rd  = normalize(uv.x * rgt + uv.y * up + 1.65 * fwd);
-
-  /* ── sphere-trace ───────────────────────────────────────────────────── */
-  float t       = 0.25;
-  float d       = 0.0;
-  bool  hit     = false;      /* FIX 3: explicit hit flag */
-  float hitIter = 0.0;
-
-  for (int i = 0; i < 90; i++) {
-    d = map(ro + rd * t);
-    if (d < 0.001) { hit = true; hitIter = gIter; break; }  /* FIX 3 */
-    if (t > 9.0) break;
-    t += d;
-  }
-
-  /* ── shading ────────────────────────────────────────────────────────── */
-  vec3 col;
-
-  if (hit) {                              /* FIX 3: was (t < 10.0) */
-    vec3  p  = ro + rd * t;
-    vec3  n  = calcNormal(p);
-    float ao = calcAO(p, n);
-
-    vec3  l1    = normalize(vec3( 0.75,  0.70, -0.25));
-    vec3  l2    = normalize(vec3(-0.50,  0.20,  0.85));
-    float diff1 = max(dot(n, l1), 0.0);
-    float diff2 = max(dot(n, l2), 0.0) * 0.30;
-    float shad  = softShadow(p, l1, 0.02, 4.0, 12.0);
-    vec3  refl  = reflect(-l1, n);
-    float spec  = pow(max(dot(refl, normalize(-rd)), 0.0), 56.0);
-
-    /* normal-palette base colour */
-    float ty = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-    float tx = clamp(n.x * 0.5 + 0.5, 0.0, 1.0);
-    float tz = clamp(n.z * 0.5 + 0.5, 0.0, 1.0);
-    vec3 base = mix(vec3(0.04,0.10,0.50), vec3(0.88,0.58,0.08), ty);
-    base = mix(base, vec3(0.50,0.05,0.48), tx * 0.40);
-    base = mix(base, vec3(0.10,0.48,0.55), tz * 0.25);
-
-    /* iteration-count cosine palette overlay */
-    float fi   = hitIter / 12.0;
-    vec3  iPal = 0.5 + 0.5 * cos(6.28318 * (fi * vec3(1.0,0.7,0.4)
-                                            + vec3(0.0,0.15,0.25)));
-    base = mix(base, iPal, 0.45);
-
-    col  = base * (0.08 + diff1 * shad + diff2) * ao;
-    col += vec3(1.00, 0.88, 0.70) * spec * shad * 0.85;
-    col  = mix(vec3(0.01,0.01,0.04), col, exp(-t * 0.20)); /* depth fog */
-
-  } else {
-    /* deep-space background + procedural stars */
-    float grad = 1.0 - smoothstep(0.0, 1.6, length(uv));
-    col = mix(vec3(0.00,0.00,0.02), vec3(0.01,0.01,0.06), grad);
-    vec2  sc   = floor(vNDC * 380.0);
-    float hash = fract(sin(dot(sc, vec2(127.1,311.7))) * 43758.5453);
-    float star = smoothstep(0.994, 1.000, hash);
-    float bri  = fract(sin(dot(sc, vec2(269.5,183.3))) * 17319.7);
-    col += vec3(star * (0.4 + 0.6 * bri));
-  }
-
-  col       = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)); /* gamma 2.2 */
-  fragColor = vec4(col, 1.0);
-}`;
-
-/* ── Three.js setup ──────────────────────────────────────────────────────── */
-const PR = Math.min(window.devicePixelRatio, 1.5);
-
-const renderer = new THREE.WebGLRenderer({ antialias: false });
-renderer.setPixelRatio(PR);
-renderer.setSize(window.innerWidth, window.innerHeight);
-document.body.appendChild(renderer.domElement);
-
-const scene  = new THREE.Scene();
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-
-const uniforms = {
-  u_time:       { value: 0.0 },
-  u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-  u_yaw:        { value: Math.PI },
-  u_pitch:      { value: 0.0 },
-  u_power:      { value: 8.0 },
-  u_radius:     { value: 2.7 },
-};
-
-/*
- * THREE.ShaderMaterial + glslVersion: THREE.GLSL3
- * ─────────────────────────────────────────────────
- * Three.js prepends "#version 300 es" automatically — never put it in
- * the shader strings or you get "version directive must occur before
- * anything else".  ShaderMaterial also auto-injects the `position`
- * attribute, so don't redeclare it in the vertex shader.
- */
-const material = new THREE.ShaderMaterial({
-  glslVersion:    THREE.GLSL3,
-  uniforms,
-  vertexShader:   VERT,
-  fragmentShader: FRAG,
-  depthTest:  false,
-  depthWrite: false,
-});
-
-scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
-
-/* ── Mouse / touch interaction ───────────────────────────────────────────── */
-let drag = false, lx = 0, ly = 0, yawOff = 0, pitchOff = 0;
-const SCALE = 0.005, PLIMIT = 1.35;
-
-const start = (x, y) => { drag = true;  lx = x; ly = y; };
-const move  = (x, y) => {
-  if (!drag) return;
-  yawOff   -= (x - lx) * SCALE;
-  pitchOff  = Math.max(-PLIMIT, Math.min(PLIMIT, pitchOff - (y - ly) * SCALE));
-  lx = x; ly = y;
-};
-const end = () => { drag = false; };
-
-const el = renderer.domElement;
-el.addEventListener('mousedown',  e => start(e.clientX, e.clientY));
-el.addEventListener('mousemove',  e => move(e.clientX, e.clientY));
-el.addEventListener('mouseup',    end);
-el.addEventListener('mouseleave', end);
-el.addEventListener('touchstart', e => { e.preventDefault(); start(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
-el.addEventListener('touchmove',  e => { e.preventDefault(); move(e.touches[0].clientX,  e.touches[0].clientY);  }, { passive: false });
-el.addEventListener('touchend',   end);
-el.addEventListener('wheel', e => {
-  e.preventDefault();
-  uniforms.u_radius.value = Math.max(1.4, Math.min(6.5, uniforms.u_radius.value + e.deltaY * 0.004));
-}, { passive: false });
-
-window.addEventListener('resize', () => {
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  uniforms.u_resolution.value.set(window.innerWidth, window.innerHeight);
-});
-
-/* ── Animation loop ──────────────────────────────────────────────────────── */
-const clock  = new THREE.Clock();
-const pvalEl = document.getElementById('pval');
-
-(function animate() {
-  requestAnimationFrame(animate);
-  const t = clock.getElapsedTime();
-
-  const power = 8.0 + Math.sin(t * 0.4) * 5.0;
-  uniforms.u_power.value = power;
-  uniforms.u_yaw.value   = t * 0.22 + yawOff;
-  uniforms.u_pitch.value = Math.sin(t * 0.17) * 0.35 + pitchOff;
-  uniforms.u_time.value  = t;
-
-  pvalEl.textContent = power.toFixed(1);
-  renderer.render(scene, camera);
-})();
-</script>
+        function animate(t) {
+            uniforms.u_time.value = t * 0.001;
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+        animate(0);
+    </script>
 </body>
 </html>
